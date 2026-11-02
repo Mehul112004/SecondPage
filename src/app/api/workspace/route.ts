@@ -1,11 +1,10 @@
-import { adminClient } from '@/lib/supabase/admin'
+import { monitor } from '@/lib/trading/monitor'
 import { access, noAccess } from '@/lib/api'
+export const maxDuration = 30
 export async function GET() {
   const auth = await access()
   if (!auth) return noAccess()
-  // Also evaluate on refresh; Cron handles monitoring while all browsers are closed.
-  const { error: monitorError } = await adminClient().rpc('monitor_brackets', { p_user: auth.user.id })
-  if (monitorError) return Response.json({ error: 'TP/SL monitor unavailable. Apply migration 002 before trading.' }, { status: 503 })
+  try { await monitor(auth.user.id) } catch { return Response.json({error:'Market monitoring unavailable. Check Upstox access and migration 003.'},{status:503}) }
   const [account, positions, notifications, fills] = await Promise.all([
     auth.client.from('accounts').select('cash').eq('user_id', auth.user.id).single(),
     auth.client.from('positions').select('*').eq('user_id', auth.user.id).order('opened_at', { ascending: false }).limit(1000),

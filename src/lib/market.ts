@@ -1,6 +1,6 @@
-export type Quote = { id: string; strike: number; type: 'CE' | 'PE'; bid: number; ask: number; ltp: number; lotSize: number; timestamp: number }
-export type Position = { id: string; contract: string; lots: number; lot_size: number; entry_price: number; opened_at: string; status: 'open' | 'closed'; exit_price: number | null; closed_at: string | null; take_profit?: number | null; stop_loss?: number | null; exit_reason?: string | null }
-export type Fill = { id: string; contract: string; side: string; lots: number; lot_size: number; price: number; created_at: string }
+export type Quote = { id: string; strike: number; type: 'CE' | 'PE'; bid: number; ask: number; ltp: number; lotSize: number; timestamp: number; symbol?: string; expiry?: string; source?: string; receivedAt?: number; lastTradeAt?: number; bidQty?: number; askQty?: number; freezeQuantity?: number }
+export type Position = { id: string; contract: string; lots: number; lot_size: number; entry_price: number; opened_at: string; status: 'open' | 'closed'; exit_price: number | null; closed_at: string | null; display_symbol?: string; expiry?: string; quote_source?: string; take_profit?: number | null; stop_loss?: number | null; exit_reason?: string | null }
+export type Fill = { display_symbol?: string; id: string; contract: string; side: string; lots: number; lot_size: number; price: number; created_at: string }
 export type TradeNotification = { id: string; message: string; created_at: string }
 export type Workspace = { cash: number; positions: Position[]; fills: Fill[]; notifications?: TradeNotification[] }
 export const INITIAL_CASH = 50_000
@@ -15,7 +15,7 @@ export function getQuotes(now = Date.now()): Quote[] {
   }))
 }
 export function unrealized(position: Position, quote?: Quote) {
-  return quote ? (quote.bid - position.entry_price) * position.lots * position.lot_size : null
+  return quote && Number.isFinite(quote.bid) && quote.bid > 0 ? (quote.bid - position.entry_price) * position.lots * position.lot_size : null
 }
 export function realized(position: Position) {
   return position.exit_price === null ? 0 : (position.exit_price - position.entry_price) * position.lots * position.lot_size

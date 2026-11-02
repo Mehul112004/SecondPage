@@ -1,82 +1,102 @@
 # SecondPage
 
-A private Next.js + Supabase paper trading app. No separate backend process.
+Private Next.js + Supabase paper trading for NIFTY options, using Upstox market data. No real broker orders and no tick storage.
 
-## Run now (no credentials needed)
+## Run
 
-Requires Node 22+ and npm (the current Supabase SDK requires Node 22).
+Requires Node 22+ and npm.
 
 ```sh
 npm install
 npm run dev
 ```
 
-Open http://localhost:3000. Without Supabase configuration the app presents a **synthetic demo**. Prices update every five seconds; demo trades live only in memory and clear on refresh. This contains no private account information and does not bypass the authenticated APIs. `/login` previews the login screen.
+Open http://localhost:3000. Without Supabase settings, the app shows a clearly labelled synthetic demo whose trades clear on refresh. Configured accounts always use Upstox; provider failures never fall back to synthetic fills.
 
 ```sh
-npm run build
-npm run typecheck
 npm test
+npm run typecheck
+npm run build
 ```
 
-## Enable private accounts
+## Supabase setup
 
-1. Create a **Supabase Free** project.
-2. In its SQL editor, run `supabase/migrations/001_private_trading.sql` once, then `supabase/migrations/002_brackets_and_wallet.sql` once. This creates accounts, positions, fills, RLS policies and an atomic order function. No tick table exists.
-3. Under Authentication configuration, **disable new user signups**, anonymous sign-ins, and unused identity providers. There is no signup UI or signup endpoint in this app. Disable signups at Supabase too; hiding a button alone is not access control.
-4. Under Authentication → Users, manually create an email/password user (auto-confirm the email if no mail delivery is configured). The migration provisions an inactive profile and ₹50,000 virtual wallet for every new user.
-5. Activate that user explicitly in the SQL editor:
+Create a Supabase **Free** project. In its SQL editor, apply these migrations **once, in order**, skipping any already applied:
+
+1. `supabase/migrations/001_private_trading.sql`
+2. `supabase/migrations/002_brackets_and_wallet.sql`
+3. `supabase/migrations/003_upstox_market_data.sql`
+
+Migration 003 adds provider metadata to trade records, enables the provider-backed execution function and disables the old synthetic monitor/fill path. Do not run the old `enable-monitor.sql` after upgrading. Existing synthetic records are preserved as legacy history, not repriced or automatically closed using real quotes. Existing open synthetic or expired contracts without quotes are shown as unavailable and require manual account reconciliation; expiry settlement is not implemented.
+
+In Authentication configuration disable **new user signups**, anonymous sign-ins and unused providers; keep email/password enabled. Create users manually under Authentication → Users (auto-confirm email if no email delivery is configured). The trigger creates an inactive profile and ₹50,000 wallet. Activate approved accounts in SQL:
 
 ```sql
 update public.profiles set active = true
 where id = (select id from auth.users where email = 'your-email@example.com');
 ```
 
-6. Copy `.env.example` to `.env.local`. Add your project URL, publishable key (legacy anon key also works), and the **server-only** service-role key. Find these in the Supabase project settings. Never put the service-role key in a `NEXT_PUBLIC_` variable or commit it. The application uses that key only for validated fills; ordinary reads use the user's session and RLS.
-7. Restart Next.js and sign in. New accounts receive ₹50,000 of virtual funds.
+Set `active = false` to revoke private data/trading access immediately through RLS and server checks. Manage password resets manually in Supabase. Do not rely only on deleting a user to revoke existing JWTs.
 
-To revoke access, set the user's `profiles.active` to `false` in the dashboard. Every data read and order operation checks that flag; RLS also denies private trading reads. Manage password resets manually in Supabase for now. Do not rely solely on deleting a user to immediately revoke existing JWTs.
+Migration 002 adjusts existing wallets by subtracting the previous ₹9.5 lakh starting allocation where sufficient cash is available, preserving execution P&L. Wallets below that cash threshold are left unchanged for manual review, not wiped or made negative.
 
-## Trading model
+## Environment
 
-- Synthetic NIFTY-style calls and puts, illustrative lot size 25, no expiry. These are **not live market contracts or historical replay**.
-- Buy 1–100 whole lots at the server's current ask; close the whole position at the server's current bid.
-- Long options only. No short selling, partial closes, limit orders, fees, taxes, expiry settlement, or margin model yet. Optional TP/SL prices can be entered with a buy and edited/removed on open positions.
-- Server validates authentication, active access, contract, lots and origin. Database locks the wallet and atomically updates cash, position and fill. Browser roles cannot write balances or invoke the fill function. Request IDs prevent duplicate fills on retries of the same request.
-- Store entry/exit executions, quantities, ownership and status. **Do not persist incoming quotes or calculated unrealized P&L.** Open P&L is calculated in the browser as `(bid - entry) × lots × lot size`. Using the bid estimates liquidation value. Quotes are discarded after the next update. Stale feeds disable orders.
-- Dashboard loads the most recent 1,000 positions and 100 fills; pagination is needed before exceeding those personal-use limits.
+Copy `.env.example` to `.env.local` and fill in:
 
-## Connect market data later
+```dotenv
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=YOUR_PUBLISHABLE_KEY
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVER_ONLY_KEY
+UPSTOX_ANALYTICS_TOKEN=YOUR_READ_ONLY_TOKEN
+MONITOR_SECRET=YOUR_RANDOM_SECRET
+```
 
-`src/lib/market.ts` is the synthetic adapter used by both the quote API and server-side fills. Replace its quote source and the corresponding contract catalogue/SQL validation together with an approved data provider. Keep provider credentials server-only. Validate timestamps and quote availability server-side before real-feed simulations. Historical replay needs an actual licensed dataset; none is bundled. Supabase is storage/auth, not a market-data provider.
+Only the two `NEXT_PUBLIC_` values are browser-safe. Never share/commit the other keys, prefix them with `NEXT_PUBLIC_`, or include them in URLs. The local environment file is ignored by Git. Rotate any credentials shared in chat.
 
-The current short-lived polling route fits serverless Next.js. A continuous provider WebSocket cannot simply stay open in a Vercel function. A future feed integration needs a provider-supported browser connection or request-based API that fits hosting limits. Never persist every tick just to update open P&L.
+Generate a random monitor secret with `openssl rand -hex 32`. Use the same value in the deployed server environment and Supabase Vault. The app's existing local environment may already contain a generated value; do not print or commit it.
 
-## Free hosting
+## Upstox provider
 
-Import this repo into **Vercel Hobby**, select Next.js and set the same three environment variables. Configure Supabase's Site URL to the deployed HTTPS URL. Keep the project on Supabase Free and Vercel Hobby; do not enable paid upgrades/add-ons. Free quotas may interrupt service, and Supabase may pause inactive projects. Large historical datasets and licensed market data may not be free. No hosting resources are created by running this repository.
+Generate an Analytics Token at https://account.upstox.com/developer/apps → Analytics. It is used only for market-data GET endpoints, not orders, portfolio, funds or account information. Confirm provider permissions for your intended personal paper-trading use.
 
-Do not enable public access to real market data without verifying provider permissions. Personal use does not automatically grant a data licence.
+- Contract catalogue: `GET /v2/option/contract`, underlying `NSE_INDEX|Nifty 50`; current expiries and lot sizes come from Upstox, not hardcoded constants.
+- Initial chain: `GET /v2/option/chain` for the selected expiry, selecting the nearest 21 strikes around spot.
+- Five-second polling: batched `GET /v2/market-quote/quotes` for the displayed strikes **and all open contracts**, including positions in other expiries.
+- Session state: `GET /v2/market/status/NSE`, combined with regular weekday 09:15–15:30 IST option-session boundaries. Provider session status handles holidays and non-normal sessions; special sessions outside regular hours are intentionally unsupported.
+- Tiny request coalescing/ephemeral caches reduce duplicate calls within an instance (catalogue: 5 minutes; snapshots: 2 seconds; status: 3 seconds). No persistent quote cache or database tick table.
+- Missing/expired instruments, expired credentials, outages, rate limits, crossed books or missing depth fail closed.
 
-## Verification limits
+The latest quote and source timestamps live in memory. Browser P&L is `(current bid - entry price) × lots × stored lot size`; unavailable bids produce unknown P&L, not fabricated values. REST polling may miss a crossing between observations.
 
-Verified compilation on Node 22, demo trade calculations, unauthenticated API rejection, and browser buy/close flows. The migration, atomic fills, request deduplication, overspending rejection, cross-user RLS isolation and disabled-user access were tested on isolated local PostgreSQL using a minimal Supabase auth schema stub. `tests/database.sql` records those transaction/isolation assertions for a disposable database. Hosted Supabase login/session refresh still requires your project; run `supabase/verify.sql` there after setup to check key grants and RLS flags.
+## Simulated fills
 
+The server re-fetches quotes on orders and resolves contracts against the current catalogue. Browser-supplied prices and lot sizes are ignored. The database locks the wallet and atomically commits cash, position, fill and (for TP/SL) notification. Request IDs deduplicate retries, and database ownership/status checks prevent double close or cross-user execution.
 
-## Upgrade an existing project: TP/SL and ₹50,000 wallet
+Buys fill at the ask and closes at the bid. The whole order must fit the displayed best-price quantity and exchange freeze limit; partial fills are not implemented. No fills outside normal market hours. Provider quote/receipt timestamps must be within 15 seconds and last-trade time within 60 seconds. This deliberately rejects illiquid contracts even if a resting bid exists. A fresh HTTP response alone is not proof of a fresh quote. If an order waits too long for a wallet lock, the database rechecks its quote age.
 
-If migration 001 is already applied, run **only** `supabase/migrations/002_brackets_and_wallet.sql` in the Supabase SQL editor. It changes new wallets to ₹50,000 and subtracts the previous ₹9.5 lakh allocation from existing cash balances where sufficient cash is available, preserving trades and their P&L. Wallets with less than ₹9.5 lakh cash are left unchanged for manual review; they are not wiped or made negative. Do not run migration 002 twice.
+Only trade details and metadata (instrument ID, display symbol, expiry, lot size, entry/exit prices, TP/SL, ownership/status) and execution notifications are stored. No tick history or unrealized P&L is persisted. Long options only; no short selling, partial closes, fees/taxes, margin model, expiry settlement or limit orders yet. Dashboard reads are bounded to 1,000 positions and 100 fills; add pagination before exceeding these personal-use limits.
 
-### Automatic exits while the app is closed
+## TP/SL and background monitoring
 
-1. Enable **pg_cron / Supabase Cron** under Integrations → Cron (or Database → Extensions).
-2. Run `supabase/enable-monitor.sql` in the SQL editor. It creates the `secondpage-brackets` job every five seconds, plus a daily cleanup for its execution logs.
-3. Verify the job in Integrations → Cron and check its run history for successful executions.
+Set optional price levels when buying, or use “Set TP/SL” on an open position. TP must be above entry and SL positive and below entry. Blank removes a level. Triggered exits fill at the observed bid, not at a guaranteed target/stop price. The database rechecks levels under lock so concurrent edits/manual closes cannot cause duplicate exits.
 
-This monitor is implemented for the **synthetic fixture feed only**: it computes the same quote in PostgreSQL without saving it. It reads only protected open positions, locks each wallet, rechecks the position and writes the close + wallet update + fill + notification atomically. Concurrent manual closes and monitor invocations cannot credit a wallet twice. Stop-loss checks have priority. A crossed level executes at the observed bid, not a guaranteed stop/target price; prices can cross and return between checks. The workspace also checks triggers on refresh. Without Cron, it cannot monitor while all app tabs are closed. Checks stop when Supabase is paused or unavailable.
+While open, the app polls its authenticated workspace, which invokes provider-backed TP/SL checks for that user. **To monitor with all tabs closed**, deploy Next.js and configure the scheduler below. No permanently running Express server or WebSocket worker is required.
 
-TP must be above entry and SL positive and below entry. Either level may be blank. Changing a level that's already crossed can cause an exit on the next check. No tick history or unrealized P&L is stored.
+1. Deploy this repository to Vercel Hobby and configure all five environment variables. Configure Supabase's Site URL to the deployed HTTPS URL. Keep both services on their free plans; do not enable paid add-ons. Free quotas, pausing, unavailable services or missed scheduled runs can interrupt monitoring.
+2. Enable `pg_cron`, `pg_net` and Vault in Supabase.
+3. Add these secrets in **Supabase Vault**:
+   - `secondpage_monitor_url`: `https://YOUR-APP.vercel.app/api/monitor`
+   - `secondpage_monitor_secret`: the server's `MONITOR_SECRET` value
+4. Run `supabase/enable-upstox-monitor.sql`. It dispatches a bearer-authenticated POST every five seconds during regular weekday market hours. The endpoint checks actual provider session status and quote freshness before any exit. The Upstox token remains only on the Next.js server.
+5. Inspect both Cron run history **and** `net._http_response`: successful HTTP queueing does not mean the endpoint succeeded. The endpoint returns checked/closed counts and session status, never credentials.
 
-Triggered exits create **persistent in-app notifications**. When the app is open, it polls every five seconds and displays new alerts. The optional “Enable desktop alerts” button requests browser notification permission; those alerts also require an open app tab and browser support. This is not offline Web Push, email, or SMS. An offline exit's in-app alert appears on the next visit.
+To stop the job: `select cron.unschedule('secondpage-upstox-monitor');`. There is no hosted scheduler configured by merely running the repository. The dispatcher function requires Vault secrets, and localhost is not reachable from Supabase. Use a permanent deployment URL without an interactive deployment-protection gate so scheduled requests can reach the endpoint; app/endpoint authentication remains enforced.
 
-When a real market-data provider is connected, replace BOTH the server quote adapter and the database synthetic monitor with provider-backed monitoring. Do not apply the synthetic monitor to real contracts. Real-feed background monitoring is not connected yet.
+Persistent in-app notifications appear on the next visit after an offline exit. Optional desktop notifications require browser permission and an open app tab; this is not offline Web Push, SMS or email.
+
+## Validation
+
+Unit tests cover demo accounting, P&L, provider normalization and mocked HTTP errors, expiry/open-position coverage, session/freshness/depth checks. `tests/upstox.sql` exercises provider-backed database fills, variable lot size, request deduplication, stale quote rejection, automatic SL, cross-user protection and notifications on a disposable PostgreSQL database after all migrations. Earlier `tests/brackets.sql` and `tests/database.sql` target migration 002's legacy synthetic model and should run before 003, not after it. `supabase/verify.sql` checks current browser grants and RLS flags on a configured project.
+
+Hosted Supabase login/order flow and the deployed Cron callback must be verified after the migrations and deployment are configured. Market-hours live freshness still requires an open-session check.
