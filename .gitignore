@@ -22,3 +22,12 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Private account and trading records
+data/
+.env
+.env.*
+!.env.example
+.next/
+out/
+*.tsbuildinfo
