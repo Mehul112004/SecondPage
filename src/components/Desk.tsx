@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { demoOrder, demoMonitor, validBrackets, getQuotes, INITIAL_CASH, realized, unrealized, type Quote, type Workspace } from '@/lib/market'
 import { executableQuote } from '@/lib/trading/quote-rules'
 import BracketFields from './BracketFields'
+import { DeskDialog, OrderTicketFrame } from './DeskDialog'
 import { logout } from '@/app/login/actions'
 const money = (value: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(value)
 const empty: Workspace = { cash: INITIAL_CASH, positions: [], fills: [] }
@@ -38,6 +39,8 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
   const [showTicket, setShowTicket] = useState(false)
   const workspaceRef = useRef(workspace)
   const locked = useRef(false)
+  // A poll started before a mutation must never overwrite its confirmed result.
+  const workspaceVersion = useRef(0)
   useEffect(() => { workspaceRef.current = workspace }, [workspace])
   useEffect(() => {
     const notices = workspace.notifications || []
@@ -59,6 +62,7 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
     async function update() {
       if (running) return
       running = true
+      const version = workspaceVersion.current
       try {
         const snapshot = demo ? null : await api(`/api/quotes${expiry ? `?expiry=${encodeURIComponent(expiry)}` : ''}`)
         const data: Quote[] = demo ? getQuotes() : snapshot.quotes
@@ -74,7 +78,7 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
             workspaceRef.current = next; setWorkspace(next)
           } else if (!demo && !locked.current) {
             const state = await api('/api/workspace')
-            if (!cancelled && !locked.current) { workspaceRef.current = state; setWorkspace(state); setLoading(false) }
+            if (!cancelled && !locked.current && version === workspaceVersion.current) { workspaceRef.current = state; setWorkspace(state); setLoading(false) }
           }
         }
       } catch (e) { if (!cancelled) { setFeedHealthy(false); if (!demo) { setLoading(true); setError(e instanceof Error ? e.message : 'Workspace sync failed. Orders are disabled until it recovers.') } } }
@@ -103,18 +107,17 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
     const position = open.find(p => p.id === editing)
     if (!position || locked.current) return
     if (!validBrackets(takeProfit, stopLoss) || (takeProfit !== null && takeProfit <= position.entry_price) || (stopLoss !== null && stopLoss >= position.entry_price)) { setError('TP must be above entry; SL must be positive and below entry.'); return }
-    locked.current = true; setBusy(true); setError('')
+    locked.current = true; workspaceVersion.current++; setBusy(true); setError('')
     try {
-      if (demo) {
-        const next = { ...workspaceRef.current, positions: workspaceRef.current.positions.map(p => p.id === editing ? { ...p, take_profit: takeProfit, stop_loss: stopLoss } : p) }
-        workspaceRef.current = next; setWorkspace(next)
-      } else {
+      if (!demo) {
         await api('/api/brackets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ positionId: editing, takeProfit, stopLoss }) })
-        await refreshWorkspace()
       }
+      // The RPC has committed. Update only these levels; the regular poll handles exits.
+      const next = { ...workspaceRef.current, positions: workspaceRef.current.positions.map(p => p.id === editing ? { ...p, take_profit: takeProfit, stop_loss: stopLoss } : p) }
+      workspaceRef.current = next; setWorkspace(next)
       setEditing(null); setMessage('TP/SL saved. Triggered levels close at the next observed bid.')
     } catch (e) { setError(e instanceof Error ? e.message : 'Unable to save TP/SL') }
-    finally { locked.current = false; setBusy(false) }
+    finally { workspaceVersion.current++; locked.current = false; setBusy(false) }
   }
   async function place(positionId?: string) {
     if (locked.current || stale || loading) return
@@ -124,7 +127,7 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
     const contract = position?.contract || selected
     const quantity = position?.lots || lots
     if (!window.confirm(`${position ? 'Close' : 'Buy'} ${quantity} lot(s) of ${name(contract)} using virtual funds? The fill uses the latest ${position ? 'bid' : 'ask'} price.`)) return
-    locked.current = true; setBusy(true); setError(''); setMessage('')
+    locked.current = true; workspaceVersion.current++; setBusy(true); setError(''); setMessage('')
     try {
       if (demo) {
         const next = demoOrder(workspaceRef.current, contract, quantity, positionId, tp === '' ? null : Number(tp), sl === '' ? null : Number(sl))
@@ -144,7 +147,7 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
       }
       setMessage(position ? 'Position closed.' : 'Practice order filled.'); setShowTicket(false)
     } catch (e) { setError(e instanceof Error ? e.message : 'Order failed') }
-    finally { locked.current = false; setBusy(false) }
+    finally { workspaceVersion.current++; locked.current = false; setBusy(false) }
   }
   return <div className="app-shell">
     <aside className="sidebar"><a className="brand" href="/">SecondPage<span>↗</span></a><div className="workspace-label">Personal workspace</div><nav aria-label="Workspace"><a className="nav-active" href="/">▦ <span>Practice desk</span></a><a href="#portfolio">▤ <span>Portfolio</span></a><a href="#activity" onClick={() => setTab('fills')}>◷ <span>Trade history</span></a></nav><div className="side-bottom"><div className="avatar">{demo ? 'D' : email[0].toUpperCase()}</div><span>{demo ? 'Demo account' : email}<small>{demo ? 'Clears on refresh' : 'Private access'}</small></span></div></aside>
@@ -154,15 +157,48 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
     <div className="metrics"><div><span>Available funds</span><strong>{loading ? '—' : money(workspace.cash)}</strong><small>Virtual buying power</small></div><div><span>Open P&L {stale && open.length > 0 ? '(stale)' : ''}</span><strong className={pnl >= 0 ? 'positive' : 'negative'}>{loading || missingQuote ? '—' : money(pnl)}</strong><small>{open.length} open position{open.length === 1 ? '' : 's'}</small></div><div><span>Realized P&L</span><strong className={booked >= 0 ? 'positive' : 'negative'}>{loading ? '—' : money(booked)}</strong><small>From closed positions</small></div><div><span>Account equity</span><strong>{loading || missingQuote ? '—' : money(workspace.cash + marketValue)}</strong><small>Cash + bid value of holdings</small></div></div>
     <div className="trading-grid"><section className="panel chain"><div className="panel-heading"><div><h2>Option chain</h2><p className="muted">{demo ? 'NIFTY-style practice contracts' : 'NIFTY options'}</p></div><span className={stale ? 'feed offline' : 'feed'}><i />{stale ? 'Feed unavailable / stale' : !demo && market.status !== 'NORMAL_OPEN' ? 'Market closed' : 'Updating every 5s'}</span></div><div className="chain-meta"><strong>{demo ? 'NIFTY demo' : `NIFTY ${market.spot ? market.spot.toLocaleString('en-IN') : '—'}`}</strong>{demo ? <span>Illustrative contracts · no expiry</span> : <label>Expiry <select aria-label="Expiry" value={expiry || market.expiry} onChange={e=>{setExpiry(e.target.value);setFeedHealthy(false);setTP('');setSL('')}} disabled={busy}>{market.expiries.map(date=><option value={date} key={date}>{date}</option>)}</select></label>}</div><div className="table-wrap"><table><thead><tr><th className="right">Call bid / ask</th><th className="strike">Strike</th><th>Put bid / ask</th></tr></thead><tbody>{strikes.map(strike => <tr key={strike}>{(['CE','PE'] as const).map((type, index) => {
       const q = quotes.find(q => q.strike === strike && q.type === type && (demo || q.expiry === market.expiry))
-      const button = <button aria-label={`Select ${strike} ${type}`} aria-pressed={selected === q?.id} className={`quote-button ${selected === q?.id ? 'selected' : ''}`} onClick={() => { if (q) { setSelected(q.id); setShowTicket(true); setMessage('') } }}>{q ? <>{q.bid.toFixed(2)} <span>/ {q.ask.toFixed(2)}</span></> : '—'}</button>
+      const button = <button aria-label={`Select ${strike} ${type}`} aria-pressed={selected === q?.id} className={`quote-button ${selected === q?.id ? 'selected' : ''}`} disabled={busy || !q} onClick={() => { if (q) { setSelected(q.id); setTP(''); setSL(''); setShowTicket(true); setError(''); setMessage('') } }}>{q ? <>{q.bid.toFixed(2)} <span>/ {q.ask.toFixed(2)}</span></> : '—'}</button>
       return index === 0 ? <td key={type} className="right">{button}</td> : <td key={type}>{button}</td>
     }).flatMap((cell, index) => index === 0 ? [cell, <td className={`strike ${strike === atm ? 'atm' : ''}`} key="strike">{strike.toLocaleString('en-IN')}{strike === atm && <small>{demo ? 'ATM demo' : 'ATM'}</small>}</td>] : [cell])}</tr>)}</tbody></table></div><div className="panel-footer">Prices in ₹ per unit. {demo ? 'Practice lot size: 25.' : `Lot size: ${quote?.lotSize || '—'}.`}<span>{quotes[0] ? new Date(quotes[0].timestamp).toLocaleTimeString('en-IN', { hour12: false }) : 'Connecting…'}</span></div></section>
-    <section className={`panel ticket ${showTicket ? 'ticket-mobile-open' : ''}`}><div className="panel-heading"><h2>Order ticket</h2><span className="buy-tag">Buy to open</span></div><div className="ticket-content"><p className="muted">{demo ? 'NIFTY demo' : `NIFTY · ${quote?.expiry || ''}`} · {quote?.type === 'CE' ? 'Call option' : 'Put option'}</p><h3>{quote ? `${quote.strike.toLocaleString('en-IN')} ${quote.type}` : 'Loading contract…'}</h3><div className="ticket-price">{quote ? money(quote.ask) : '—'}<small>Ask price / unit</small></div><label className="quantity-label">Number of lots<div className="stepper"><button aria-label="Decrease lots" onClick={() => setLots(n => Math.max(1,n-1))} disabled={busy || lots <= 1}>−</button><input aria-label="Number of lots" type="number" min="1" max="100" value={lots} onChange={e => setLots(Math.max(1, Math.min(100, Math.floor(Number(e.target.value) || 1))))} disabled={busy} /><button aria-label="Increase lots" onClick={() => setLots(n => Math.min(100,n+1))} disabled={busy || lots >= 100}>+</button></div></label><BracketFields tp={tp} sl={sl} onTP={setTP} onSL={setSL} disabled={busy} /><p className="ticket-note">Optional price levels per unit. TP above entry, SL below entry.</p><dl><div><dt>Quantity</dt><dd>{lots * (quote?.lotSize || 25)} units</dd></div><div><dt>Estimated premium</dt><dd>{quote ? money(quote.ask * lots * quote.lotSize) : '—'}</dd></div><div><dt>Available funds</dt><dd>{money(workspace.cash)}</dd></div></dl><button className="primary" onClick={() => void place()} disabled={busy || tradeBlocked || loading || !quote || quote.ask * lots * quote.lotSize > workspace.cash}>{busy ? 'Processing…' : 'Buy with virtual funds'}</button><p className="ticket-note">{buyProblem && <span className="negative">{buyProblem} </span>}Market simulation. Buys fill at the latest ask; closes at the latest bid. Fees and slippage are not included.</p></div></section></div>
+    <OrderTicketFrame open={showTicket} onClose={() => setShowTicket(false)} busy={busy}><div className="panel-heading"><h2>Order ticket</h2><div className="ticket-heading-actions"><span className="buy-tag">Buy to open</span><button className="close-button ticket-dismiss" aria-label="Dismiss order ticket" disabled={busy} onClick={() => setShowTicket(false)}>✕</button></div></div><div className="ticket-content"><p className="muted">{demo ? 'NIFTY demo' : `NIFTY · ${quote?.expiry || ''}`} · {quote?.type === 'CE' ? 'Call option' : 'Put option'}</p><h3>{quote ? `${quote.strike.toLocaleString('en-IN')} ${quote.type}` : 'Loading contract…'}</h3><div className="ticket-price">{quote ? money(quote.ask) : '—'}<small>Ask price / unit</small></div><label className="quantity-label">Number of lots<div className="stepper"><button aria-label="Decrease lots" onClick={() => setLots(n => Math.max(1,n-1))} disabled={busy || lots <= 1}>−</button><input aria-label="Number of lots" type="number" min="1" max="100" value={lots} onChange={e => setLots(Math.max(1, Math.min(100, Math.floor(Number(e.target.value) || 1))))} disabled={busy} /><button aria-label="Increase lots" onClick={() => setLots(n => Math.min(100,n+1))} disabled={busy || lots >= 100}>+</button></div></label><BracketFields tp={tp} sl={sl} onTP={setTP} onSL={setSL} disabled={busy} entryPrice={quote?.ask} /><p className="ticket-note">Optional price levels per unit. TP above entry, SL below entry.</p><dl><div><dt>Quantity</dt><dd>{lots * (quote?.lotSize || 25)} units</dd></div><div><dt>Estimated premium</dt><dd>{quote ? money(quote.ask * lots * quote.lotSize) : '—'}</dd></div><div><dt>Available funds</dt><dd>{money(workspace.cash)}</dd></div></dl><p className="ticket-note">{buyProblem && <span className="negative">{buyProblem} </span>}Market simulation. Buys fill at the latest ask; closes at the latest bid. Fees and slippage are not included.</p></div><div className="ticket-submit">{error && <p role="alert" className="error-box dialog-error">{error}</p>}<button className="primary" onClick={() => void place()} disabled={busy || tradeBlocked || loading || !quote || quote.ask * lots * quote.lotSize > workspace.cash}>{busy ? 'Processing…' : 'Buy with virtual funds'}</button></div></OrderTicketFrame></div>
     {!demo && market.unavailablePositions.length > 0 && <p className="error-box">Some open positions have no current Upstox quote (legacy demo or expired contracts). P&L is unavailable and automated exits are disabled for those positions.</p>}
     <div aria-live="polite" className="feedback">{error && <p role="alert" className="error-box">{error}</p>}{message && <p className="success-box">{message}</p>}</div>
     <section className="panel portfolio" id="portfolio"><div className="portfolio-heading" id="activity"><div className="tabs" role="tablist" aria-label="Portfolio view">{(['open','closed','fills'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} className={tab === value ? 'active-tab' : ''} onClick={() => setTab(value)}>{value === 'open' ? `Open positions (${open.length})` : value === 'closed' ? 'Closed positions' : 'Trade history'}</button>)}</div><span className="muted">{tab === 'open' ? 'Marked to bid' : 'Saved fills'}</span></div>
-    {loading ? <div className="empty-state"><h3>Loading your workspace…</h3><p>Retrieving your private positions and funds.</p></div> : tab === 'fills' ? workspace.fills.length === 0 ? <Empty title="Your trading story starts here." text="Filled orders will appear here, with their execution prices." /> : <div className="table-wrap"><table><thead><tr><th>Contract</th><th>Side</th><th>Quantity</th><th>Fill price</th><th>Time</th></tr></thead><tbody>{workspace.fills.map(fill => <tr key={fill.id}><td className="contract-cell">{fill.display_symbol || name(fill.contract)}<small>{fill.contract.startsWith('DEMO-') ? 'Synthetic' : 'NIFTY · Upstox'}</small></td><td><span className={fill.side === 'BUY' ? 'positive' : 'negative'}>{fill.side}</span></td><td>{fill.lots * fill.lot_size}</td><td>{money(fill.price)}</td><td>{new Date(fill.created_at).toLocaleString('en-IN')}</td></tr>)}</tbody></table></div> : (tab === 'open' ? open : closed).length === 0 ? <Empty title={tab === 'open' ? 'A clean slate. Your next move.' : 'No closed positions yet.'} text={tab === 'open' ? 'Select a contract from the option chain to place your first practice trade.' : 'Close an open position to see its realized result here.'} /> : <div className="table-wrap"><table><thead><tr><th>Contract</th><th>Quantity</th><th>Entry</th><th>{tab === 'open' ? 'Current bid' : 'Exit'}</th><th>TP / SL</th><th>P&L</th><th /></tr></thead><tbody>{(tab === 'open' ? open : closed).map(position => { const q = quotes.find(q => q.id === position.contract); const result = tab === 'open' ? unrealized(position,q) : realized(position); return <tr key={position.id}><td className="contract-cell">{name(position.contract)}<small>{position.quote_source === 'upstox' ? `Expiry ${position.expiry}` : 'Synthetic'} · {position.lots} lot{position.lots > 1 ? 's' : ''}</small></td><td>{position.lots * position.lot_size}</td><td>{money(position.entry_price)}</td><td>{tab === 'open' ? q ? money(q.bid) : '—' : money(position.exit_price!)}</td><td>{position.take_profit == null ? '—' : money(position.take_profit)} / {position.stop_loss == null ? '—' : money(position.stop_loss)}{position.exit_reason && position.exit_reason !== 'manual' && <small>{position.exit_reason === 'take_profit' ? 'TP triggered' : 'SL triggered'}</small>}</td><td className={result === null ? '' : result >= 0 ? 'positive' : 'negative'}>{result === null ? '—' : money(result)}{tab === 'open' && stale && <small>Stale</small>}</td><td>{tab === 'open' && <><button className="close-button" disabled={busy} onClick={() => { setEditing(position.id); setEditTP(position.take_profit?.toString() || ''); setEditSL(position.stop_loss?.toString() || '') }}>Set TP/SL</button> <button className="close-button" disabled={busy || !feedHealthy || loading || !q || (!demo && Boolean(executableQuote(q,market.status,'SELL',clock || Date.now())))} onClick={() => void place(position.id)}>Close position</button></>}</td></tr> })}</tbody></table></div>}</section>
-    {editing && <section className="panel bracket-editor" aria-label="Edit position TP/SL"><h2>Edit TP/SL · {name(open.find(p => p.id === editing)?.contract || '')}</h2><p className="muted">Leave a field blank to remove that level. Crossed levels close at the next observed bid.</p><BracketFields tp={editTP} sl={editSL} onTP={setEditTP} onSL={setEditSL} disabled={busy} /><div className="editor-actions"><button className="close-button" disabled={busy} onClick={() => setEditing(null)}>Cancel</button><button className="primary" disabled={busy} onClick={() => void saveBrackets()}>Save TP/SL</button></div></section>}
+    {loading ? <div className="empty-state"><h3>Loading your workspace…</h3><p>Retrieving your private positions and funds.</p></div>
+      : tab === 'fills' ? workspace.fills.length === 0 ? <Empty title="Your trading story starts here." text="Filled orders will appear here, with their execution prices." />
+        : <div className="table-wrap"><table className="activity-table"><thead><tr><th>Contract</th><th>Side</th><th>Quantity</th><th>Fill price</th><th>Time (IST)</th></tr></thead><tbody>{workspace.fills.map(fill => <tr key={fill.id}>
+          <td className="contract-cell" data-label="Contract">{fill.display_symbol || name(fill.contract)}<small>{fill.contract.startsWith('DEMO-') ? 'Synthetic' : 'NIFTY · Upstox'}</small></td>
+          <td data-label="Side"><span className={fill.side === 'BUY' ? 'positive' : 'negative'}>{fill.side}</span></td><td data-label="Quantity">{fill.lots * fill.lot_size}</td><td data-label="Fill price">{money(fill.price)}</td><td data-label="Time (IST)"><PositionTime value={fill.created_at} /></td>
+        </tr>)}</tbody></table></div>
+      : (tab === 'open' ? open : closed).length === 0 ? <Empty title={tab === 'open' ? 'A clean slate. Your next move.' : 'No closed positions yet.'} text={tab === 'open' ? 'Select a contract from the option chain to place your first practice trade.' : 'Close an open position to see its realized result here.'} />
+        : <div className="table-wrap"><table className="positions-table"><thead><tr><th>Contract</th><th>Quantity</th><th>Capital used</th><th>Entry</th><th>{tab === 'open' ? 'Current bid' : 'Exit'}</th><th>TP / SL</th><th>P&L</th><th>Opened (IST)</th><th>Closed (IST)</th>{tab === 'open' && <th><span className="sr-only">Actions</span></th>}</tr></thead><tbody>{(tab === 'open' ? open : closed).map(position => {
+          const q = quotes.find(q => q.id === position.contract)
+          const result = tab === 'open' ? unrealized(position, q) : realized(position)
+          return <tr key={position.id}>
+            <td className="contract-cell" data-label="Contract">{name(position.contract)}<small>{position.quote_source === 'upstox' ? `Expiry ${position.expiry}` : 'Synthetic'} · {position.lots} lot{position.lots > 1 ? 's' : ''}</small></td>
+            <td data-label="Quantity">{position.lots * position.lot_size}</td>
+            <td data-label="Capital used" className="capital-cell">{money(position.entry_price * position.lots * position.lot_size)}</td>
+            <td data-label="Entry">{money(position.entry_price)}</td>
+            <td data-label={tab === 'open' ? 'Current bid' : 'Exit'}>{tab === 'open' ? q ? money(q.bid) : '—' : money(position.exit_price!)}</td>
+            <td data-label="TP / SL">{position.take_profit == null ? '—' : money(position.take_profit)} / {position.stop_loss == null ? '—' : money(position.stop_loss)}{position.exit_reason && position.exit_reason !== 'manual' && <small>{position.exit_reason === 'take_profit' ? 'TP triggered' : 'SL triggered'}</small>}</td>
+            <td data-label="P&L" className={result === null ? '' : result >= 0 ? 'positive' : 'negative'}>{result === null ? '—' : money(result)}{tab === 'open' && stale && <small>Stale</small>}</td>
+            <td data-label="Opened (IST)"><PositionTime value={position.opened_at} /></td>
+            <td data-label="Closed (IST)">{position.closed_at ? <PositionTime value={position.closed_at} /> : <span className="muted">Still open</span>}</td>
+            {tab === 'open' && <td className="position-actions"><button className="close-button" disabled={busy} onClick={() => { setEditing(position.id); setEditTP(position.take_profit?.toString() || ''); setEditSL(position.stop_loss?.toString() || ''); setError(''); setMessage('') }}>Set TP/SL</button><button className="close-button" disabled={busy || !feedHealthy || loading || !q || (!demo && Boolean(executableQuote(q,market.status,'SELL',clock || Date.now())))} onClick={() => void place(position.id)}>Close position</button></td>}
+          </tr>
+        })}</tbody></table></div>}
+    </section>
+    <DeskDialog open={editing !== null} onClose={() => setEditing(null)} busy={busy} label="Edit position TP/SL" className="bracket-dialog">
+      {editing && <form onSubmit={event => { event.preventDefault(); void saveBrackets() }}>
+        <div className="dialog-heading"><h2>Edit TP/SL</h2><button type="button" className="close-button" aria-label="Dismiss TP/SL editor" disabled={busy} onClick={() => setEditing(null)}>✕</button></div>
+        <p className="editor-contract">{name(open.find(p => p.id === editing)?.contract || '')}</p>
+        <p className="muted">Entry {money(open.find(p => p.id === editing)?.entry_price || 0)} per unit. Shortcuts use this entry price.</p>
+        <BracketFields tp={editTP} sl={editSL} onTP={setEditTP} onSL={setEditSL} disabled={busy} entryPrice={open.find(p => p.id === editing)?.entry_price} />
+        <p className="ticket-note">TP above entry; SL below entry. Clear a field to remove that level. Crossed levels close at the next observed bid.</p>
+        {error && <p role="alert" className="error-box dialog-error">{error}</p>}
+        <div className="editor-actions"><button type="button" className="close-button" disabled={busy} onClick={() => setEditing(null)}>Cancel</button><button type="submit" className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save TP/SL'}</button></div>
+      </form>}
+    </DeskDialog>
     <section className="panel notifications"><div className="panel-heading"><h2>Notifications</h2><button className="close-button" disabled={desktopNotifications} onClick={async () => {
       if (!('Notification' in window)) { setError('Desktop notifications are not supported by this browser. In-app notifications remain available.'); return }
       const permission = await Notification.requestPermission()
@@ -172,3 +208,10 @@ export default function Desk({ demo, email }: { demo: boolean; email: string }) 
     <footer className="desk-footer"><span>Practice with intention.</span><span>{demo ? 'Synthetic data' : 'Upstox · 5s polling'} · Long options only · No tick data stored</span></footer></main></div></div>
 }
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty-state"><div className="empty-symbol">▥</div><h3>{title}</h3><p>{text}</p></div> }
+
+const positionDate = new Intl.DateTimeFormat('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' })
+const positionClock = new Intl.DateTimeFormat('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' })
+function PositionTime({ value }: { value: string }) {
+  const date = new Date(value)
+  return <time dateTime={value}>{positionDate.format(date)}<small>{positionClock.format(date)} IST</small></time>
+}
