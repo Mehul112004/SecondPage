@@ -1,3 +1,10 @@
+# Repository layout
+
+- `SecondPage-Web` contains the existing Next.js site, API and Supabase setup. Its Next.js guides resolve at `SecondPage-Web/node_modules/next/dist/docs/`.
+- `SecondPage-App` contains the Expo / React Native client. Follow its own `AGENTS.md` and matching SDK documentation.
+- Keep independent dependencies and lockfiles in the two projects; `.git` stays at this root.
+- Do not use computer use, browser automation or a simulator to test this implementation. The user will test it manually; static checks and unit tests are allowed.
+
 <!-- BEGIN:nextjs-agent-rules -->
 
 ## This is NOT the Next.js you know
